@@ -2,41 +2,54 @@
 
 import boto3
 import json
-import threading
 
-def export_security_group(region, sg):
-    """Export details of a single security group into a unique file."""
+def get_security_group_info(region, sg_identifier):
+    """Fetch security group details, rules, and attached resources"""
+    ec2 = boto3.client('ec2', region_name=region)
+    
+    # Identify SG by ID or Name
+    sgs = ec2.describe_security_groups(Filters=[{'Name': 'group-id', 'Values': [sg_identifier]}])['SecurityGroups']
+    if not sgs:
+        sgs = ec2.describe_security_groups(Filters=[{'Name': 'group-name', 'Values': [sg_identifier]}])['SecurityGroups']
+    if not sgs:
+        print(f"❌ Security Group '{sg_identifier}' not found in region {region}.")
+        return None
+
+    sg = sgs[0]  # Assume one SG found
     sg_id = sg['GroupId']
     sg_name = sg.get('GroupName', 'Unknown')
     vpc_id = sg.get('VpcId', 'Unknown')
     description = sg.get('Description', 'No description')
 
-    ec2 = boto3.client('ec2', region_name=region)
-    rds_client = boto3.client('rds', region_name=region)
-    elb_client = boto3.client('elbv2', region_name=region)
-
-    # Get EC2 instances using this SG
+    # Get EC2 instances using SG
     instances = ec2.describe_instances(Filters=[{"Name": "instance.group-id", "Values": [sg_id]}])['Reservations']
     ec2_instances = [i['Instances'][0]['InstanceId'] for i in instances if i['Instances']]
 
-    # Get RDS instances using this SG
+    # Get RDS instances using SG
+    rds_client = boto3.client('rds', region_name=region)
     rds_instances = [
         db['DBInstanceIdentifier']
         for db in rds_client.describe_db_instances()['DBInstances']
         if any(sg['VpcSecurityGroupId'] == sg_id for sg in db['VpcSecurityGroups'])
     ]
 
-    # Get Load Balancers using this SG
+    # Get Load Balancers using SG
+    elb_client = boto3.client('elbv2', region_name=region)
     elbs = [
         lb['LoadBalancerArn']
         for lb in elb_client.describe_load_balancers()['LoadBalancers']
         if sg_id in lb.get('SecurityGroups', [])
     ]
 
+    # Identify rules that allow 0.0.0.0/0 (Open to the world)
+    open_rules = [rule for rule in sg.get('IpPermissions', []) if any(ip['CidrIp'] == '0.0.0.0/0' for ip in rule.get('IpRanges', []))]
+    affected_resources = {'EC2': ec2_instances, 'RDS': rds_instances, 'ELB': elbs} if open_rules else {}
+
     # Format the report
-    report_content = f"""
-    AWS Security Group Report - {region}
-    ===================================
+    report = f"""
+    AWS Security Group Report
+    ==========================
+    Region: {region}
     Security Group ID: {sg_id}
     Name: {sg_name}
     VPC: {vpc_id}
@@ -51,39 +64,55 @@ def export_security_group(region, sg):
     EC2 Instances: {', '.join(ec2_instances) if ec2_instances else 'None'}
     RDS Instances: {', '.join(rds_instances) if rds_instances else 'None'}
     Load Balancers: {', '.join(elbs) if elbs else 'None'}
-    ===================================
+
+    Rules Allowing 0.0.0.0/0:
+    --------------------------
+    {json.dumps(open_rules, indent=4) if open_rules else "None"}
+
+    Resources Associated with Open Rules:
+    -------------------------------------
+    {json.dumps(affected_resources, indent=4) if affected_resources else "None"}
     """
 
-    # Save report in a unique file
     filename = f"sg_report_{sg_id}.txt"
     with open(filename, "w") as file:
-        file.write(report_content)
+        file.write(report)
 
-    print(f"✅ Exported Security Group: {sg_id} -> {filename}")
+    print(f"\n✅ Security Group report saved: {filename}")
 
-def get_all_security_groups(region):
-    """Fetch all security groups and create reports concurrently"""
+    return sg_id, sg.get('IpPermissions', []), vpc_id, open_rules  # Return values for migration
+
+def create_new_sg(region, old_sg_id, old_sg_rules, vpc_id, open_rules):
+    """Create a new security group without 0.0.0.0/0 rules"""
     ec2 = boto3.client('ec2', region_name=region)
-    
-    # Get all security groups in the region
-    security_groups = ec2.describe_security_groups()['SecurityGroups']
 
-    if not security_groups:
-        print(f"No security groups found in region {region}.")
-        return
+    # Create a new security group
+    new_sg_name = f"migrated-{old_sg_id}"
+    new_sg = ec2.create_security_group(
+        GroupName=new_sg_name,
+        Description=f"Replacement for {old_sg_id} without 0.0.0.0/0",
+        VpcId=vpc_id
+    )
+    new_sg_id = new_sg['GroupId']
+    print(f"✅ Created new Security Group: {new_sg_id}")
 
-    print(f"🔎 Found {len(security_groups)} security groups in {region}. Exporting...")
+    # Remove rules with 0.0.0.0/0
+    sanitized_rules = [
+        rule for rule in old_sg_rules
+        if not any(ip['CidrIp'] == '0.0.0.0/0' for ip in rule.get('IpRanges', []))
+    ]
 
-    # Use threading for concurrent exports
-    threads = []
-    for sg in security_groups:
-        thread = threading.Thread(target=export_security_group, args=(region, sg))
-        thread.start()
-        threads.append(thread)
+    # Copy only the safe rules to the new SG
+    if sanitized_rules:
+        ec2.authorize_security_group_ingress(GroupId=new_sg_id, IpPermissions=sanitized_rules)
+    print(f"✅ Copied {len(sanitized_rules)} rules to new SG (0.0.0.0/0 rules removed)")
 
-    # Don't wait for all to finish (exports independently)
-    print(f"🚀 Exporting security groups concurrently...")
+    return new_sg_id
 
 if __name__ == "__main__":
     region = input("Enter AWS Region: ").strip()
-    get_all_security_groups(region)
+    sg_identifier = input("Enter Security Group ID or Name: ").strip()
+
+    sg_id, old_rules, vpc_id, open_rules = get_security_group_info(region, sg_identifier)
+    if sg_id:
+        create_new_sg(region, sg_id, old_rules, vpc_id, open_rules)
